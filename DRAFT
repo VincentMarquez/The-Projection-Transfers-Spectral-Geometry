@@ -1,0 +1,573 @@
+
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+# --- 1. MATH ENGINE (Same as before) ---
+
+def compute_density_matrix(data_tensor):
+    """
+    Computes rho = (1/N) * X^T * X
+    Input: (B, L, D) -> Output: (D, D)
+    """
+    X = data_tensor.reshape(-1, data_tensor.shape[-1])
+    X = X - X.mean(dim=0, keepdim=True)  # Center
+    N = X.shape[0]
+    rho = (X.T @ X) / N
+    return rho
+
+def get_projector(rho, rank):
+    """
+    Computes Pi = sum(|u><u|) for top-k eigenvectors
+    """
+    evals, evecs = torch.linalg.eigh(rho.to(torch.float64))
+    idx = torch.argsort(evals, descending=True)
+    evecs = evecs[:, idx]
+    evals = evals[idx]
+    
+    # Clamp rank to valid range
+    max_rank = rho.shape[0]
+    rank = min(rank, max_rank)
+    
+    U = evecs[:, :rank].to(torch.float32)
+    Pi = U @ U.T
+    return Pi, evals.to(torch.float32)
+
+def calculate_fidelity(source_data, target_data, rank):
+    """
+    F = Tr(Pi_source * rho_target) / Tr(rho_target)
+    """
+    rho_s = compute_density_matrix(source_data)
+    rho_t = compute_density_matrix(target_data)
+    
+    Pi_s, evals_s = get_projector(rho_s, rank)
+    
+    energy_preserved = torch.trace(Pi_s @ rho_t)
+    total_energy = torch.trace(rho_t)
+    
+    fidelity = energy_preserved / total_energy
+    return fidelity.item(), evals_s
+
+def get_intrinsic_dimension(data_tensor, threshold=0.95):
+    """
+    Estimate intrinsic dimension by counting eigenvalues
+    needed to capture `threshold` of total variance.
+    """
+    rho = compute_density_matrix(data_tensor)
+    evals, _ = torch.linalg.eigh(rho.to(torch.float64))
+    evals = torch.sort(evals, descending=True).values
+    evals = evals / evals.sum()  # Normalize
+    
+    cumsum = torch.cumsum(evals, dim=0)
+    intrinsic_dim = (cumsum < threshold).sum().item() + 1
+    return intrinsic_dim, evals.to(torch.float32)
+
+# --- 2. 3D DATA GENERATORS ---
+
+def make_line_3d(direction='x', n_points=1000):
+    """1D manifold in ℝ³: a line along one axis"""
+    t = torch.linspace(-1, 1, n_points).unsqueeze(1)
+    zero = torch.zeros_like(t)
+    
+    if direction == 'x':
+        data = torch.cat([t, zero, zero], dim=1)
+    elif direction == 'y':
+        data = torch.cat([zero, t, zero], dim=1)
+    elif direction == 'z':
+        data = torch.cat([zero, zero, t], dim=1)
+    elif direction == 'diagonal_xy':
+        data = torch.cat([t, t, zero], dim=1)
+    elif direction == 'diagonal_xyz':
+        data = torch.cat([t, t, t], dim=1)
+    
+    return data.unsqueeze(0)
+
+def make_plane_3d(plane='xy', n_points=1000):
+    """2D manifold in ℝ³: a flat plane"""
+    side = int(np.sqrt(n_points))
+    u = torch.linspace(-1, 1, side)
+    v = torch.linspace(-1, 1, side)
+    U, V = torch.meshgrid(u, v, indexing='ij')
+    U, V = U.flatten().unsqueeze(1), V.flatten().unsqueeze(1)
+    zero = torch.zeros_like(U)
+    
+    if plane == 'xy':
+        data = torch.cat([U, V, zero], dim=1)
+    elif plane == 'xz':
+        data = torch.cat([U, zero, V], dim=1)
+    elif plane == 'yz':
+        data = torch.cat([zero, U, V], dim=1)
+    elif plane == 'diagonal':  # Tilted plane
+        data = torch.cat([U, V, (U + V) / 2], dim=1)
+    
+    return data.unsqueeze(0)
+
+def make_circle_3d(plane='xy', n_points=1000):
+    """1D manifold in ℝ³: circle embedded in a plane"""
+    t = torch.linspace(0, 2*np.pi, n_points).unsqueeze(1)
+    cos_t = torch.cos(t)
+    sin_t = torch.sin(t)
+    zero = torch.zeros_like(t)
+    
+    if plane == 'xy':
+        data = torch.cat([cos_t, sin_t, zero], dim=1)
+    elif plane == 'xz':
+        data = torch.cat([cos_t, zero, sin_t], dim=1)
+    elif plane == 'yz':
+        data = torch.cat([zero, cos_t, sin_t], dim=1)
+    
+    return data.unsqueeze(0)
+
+def make_helix_3d(n_points=1000, turns=3):
+    """1D manifold in ℝ³: helix (uses all 3 dimensions!)"""
+    t = torch.linspace(0, turns * 2 * np.pi, n_points).unsqueeze(1)
+    x = torch.cos(t)
+    y = torch.sin(t)
+    z = t / (turns * 2 * np.pi)  # Normalized height
+    return torch.cat([x, y, z], dim=1).unsqueeze(0)
+
+def make_sphere_surface(n_points=1000):
+    """2D manifold in ℝ³: sphere surface"""
+    # Fibonacci sphere for uniform distribution
+    indices = torch.arange(0, n_points, dtype=torch.float32) + 0.5
+    phi = torch.acos(1 - 2 * indices / n_points)
+    theta = np.pi * (1 + 5**0.5) * indices
+    
+    x = torch.sin(phi) * torch.cos(theta)
+    y = torch.sin(phi) * torch.sin(theta)
+    z = torch.cos(phi)
+    
+    data = torch.stack([x, y, z], dim=1)
+    return data.unsqueeze(0)
+
+def make_swiss_roll(n_points=1000):
+    """2D manifold in ℝ³: swiss roll"""
+    t = torch.linspace(1.5*np.pi, 4.5*np.pi, n_points)
+    height = torch.linspace(0, 1, n_points)
+    
+    x = t * torch.cos(t)
+    y = height
+    z = t * torch.sin(t)
+    
+    # Normalize
+    data = torch.stack([x, y, z], dim=1)
+    data = data / data.abs().max()
+    return data.unsqueeze(0)
+
+# --- 3. HIGHER DIMENSIONAL GENERATORS ---
+
+def make_hyperplane(ambient_dim=10, intrinsic_dim=3, n_points=1000):
+    """
+    k-dimensional hyperplane in ℝⁿ
+    """
+    # Random points in ℝ^k
+    coords = torch.randn(n_points, intrinsic_dim)
+    
+    # Random orthonormal basis for the plane
+    basis = torch.randn(intrinsic_dim, ambient_dim)
+    basis, _ = torch.linalg.qr(basis.T)  # Orthonormalize
+    basis = basis[:, :intrinsic_dim].T  # (k, n)
+    
+    # Embed: each point is a linear combination of basis vectors
+    data = coords @ basis  # (n_points, ambient_dim)
+    return data.unsqueeze(0)
+
+def make_hypersphere(ambient_dim=10, n_points=1000):
+    """
+    (n-1)-dimensional sphere surface in ℝⁿ
+    """
+    data = torch.randn(n_points, ambient_dim)
+    data = data / data.norm(dim=1, keepdim=True)  # Project to unit sphere
+    return data.unsqueeze(0)
+
+def make_random_subspace(ambient_dim=10, intrinsic_dim=5, n_points=1000, noise=0.0):
+    """
+    Random k-dimensional subspace with optional noise
+    """
+    # Generate random orthonormal basis
+    basis = torch.randn(ambient_dim, intrinsic_dim)
+    basis, _ = torch.linalg.qr(basis)
+    
+    # Generate points in subspace
+    coords = torch.randn(n_points, intrinsic_dim)
+    data = coords @ basis.T
+    
+    # Add noise
+    if noise > 0:
+        data = data + noise * torch.randn_like(data)
+    
+    return data.unsqueeze(0), basis
+
+# --- 4. VISUALIZATION ---
+
+def plot_3d_data(data_dict, title="3D Data Manifolds"):
+    """Plot multiple 3D datasets"""
+    n = len(data_dict)
+    fig = plt.figure(figsize=(5*n, 5))
+    
+    for i, (name, data) in enumerate(data_dict.items()):
+        ax = fig.add_subplot(1, n, i+1, projection='3d')
+        d = data.squeeze().numpy()
+        ax.scatter(d[:, 0], d[:, 1], d[:, 2], s=1, alpha=0.6)
+        ax.set_title(name)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+    
+    plt.suptitle(title)
+    plt.tight_layout()
+    return fig
+
+def plot_eigenspectrum(data_dict, title="Eigenvalue Spectra"):
+    """Plot eigenvalue spectra for multiple datasets"""
+    fig, axes = plt.subplots(1, len(data_dict), figsize=(4*len(data_dict), 4))
+    if len(data_dict) == 1:
+        axes = [axes]
+    
+    for ax, (name, data) in zip(axes, data_dict.items()):
+        rho = compute_density_matrix(data)
+        evals, _ = torch.linalg.eigh(rho.to(torch.float64))
+        evals = torch.sort(evals, descending=True).values.numpy()
+        
+        # Normalize
+        evals = evals / evals.sum()
+        
+        ax.bar(range(len(evals)), evals, color='steelblue', edgecolor='black')
+        ax.set_title(f"{name}\nIntrinsic Dim ≈ {(evals > 0.01).sum()}")
+        ax.set_xlabel("Eigenvalue Index")
+        ax.set_ylabel("Normalized Eigenvalue")
+        ax.set_ylim(0, 1.1)
+    
+    plt.suptitle(title)
+    plt.tight_layout()
+    return fig
+
+def plot_fidelity_matrix(tasks, ranks, title="Fidelity Matrix"):
+    """
+    Compute and plot fidelity matrix for all task pairs at different ranks
+    """
+    task_names = list(tasks.keys())
+    n_tasks = len(task_names)
+    n_ranks = len(ranks)
+    
+    fig, axes = plt.subplots(1, n_ranks, figsize=(5*n_ranks, 5))
+    if n_ranks == 1:
+        axes = [axes]
+    
+    for ax, rank in zip(axes, ranks):
+        fid_matrix = np.zeros((n_tasks, n_tasks))
+        
+        for i, src_name in enumerate(task_names):
+            for j, tgt_name in enumerate(task_names):
+                fid, _ = calculate_fidelity(tasks[src_name], tasks[tgt_name], rank)
+                fid_matrix[i, j] = fid
+        
+        im = ax.imshow(fid_matrix, vmin=0, vmax=1, cmap='RdYlGn')
+        ax.set_xticks(range(n_tasks))
+        ax.set_yticks(range(n_tasks))
+        ax.set_xticklabels(task_names, rotation=45, ha='right')
+        ax.set_yticklabels(task_names)
+        ax.set_xlabel("Target Task")
+        ax.set_ylabel("Source Task")
+        ax.set_title(f"Rank = {rank}")
+        
+        # Annotate
+        for i in range(n_tasks):
+            for j in range(n_tasks):
+                ax.text(j, i, f"{fid_matrix[i,j]:.2f}", 
+                       ha='center', va='center', fontsize=8,
+                       color='white' if fid_matrix[i,j] < 0.5 else 'black')
+        
+        plt.colorbar(im, ax=ax, shrink=0.8)
+    
+    plt.suptitle(title)
+    plt.tight_layout()
+    return fig
+
+# --- 5. EXPERIMENTS ---
+
+def run_3d_experiment():
+    print("=" * 80)
+    print("EXPERIMENT 1: 3D Manifolds")
+    print("=" * 80)
+    
+    tasks = {
+        "Line-X": make_line_3d('x'),
+        "Line-Y": make_line_3d('y'),
+        "Line-Z": make_line_3d('z'),
+        "Line-Diag": make_line_3d('diagonal_xyz'),
+        "Plane-XY": make_plane_3d('xy'),
+        "Plane-XZ": make_plane_3d('xz'),
+        "Circle-XY": make_circle_3d('xy'),
+        "Helix": make_helix_3d(),
+        "Sphere": make_sphere_surface(),
+    }
+    
+    # Print intrinsic dimensions
+    print("\nIntrinsic Dimensions (95% variance threshold):")
+    print("-" * 50)
+    for name, data in tasks.items():
+        dim, evals = get_intrinsic_dimension(data)
+        print(f"{name:<15} | Intrinsic Dim: {dim} | Top Evals: {evals[:3].numpy().round(4)}")
+    
+    # Visualize some manifolds
+    viz_tasks = {k: tasks[k] for k in ["Line-X", "Circle-XY", "Helix", "Sphere"]}
+    fig1 = plot_3d_data(viz_tasks, "3D Manifolds")
+    plt.savefig("manifolds_3d.png", dpi=150, bbox_inches='tight')
+    
+    # Eigenspectra
+    fig2 = plot_eigenspectrum(viz_tasks, "Eigenvalue Spectra (3D)")
+    plt.savefig("eigenspectra_3d.png", dpi=150, bbox_inches='tight')
+    
+    # Fidelity analysis
+    print("\n" + "=" * 80)
+    print("FIDELITY ANALYSIS")
+    print("=" * 80)
+    
+    # Subset for cleaner visualization
+    test_tasks = {k: tasks[k] for k in ["Line-X", "Line-Diag", "Plane-XY", "Helix", "Sphere"]}
+    
+    fig3 = plot_fidelity_matrix(test_tasks, ranks=[1, 2, 3], title="Transfer Fidelity (3D Tasks)")
+    plt.savefig("fidelity_matrix_3d.png", dpi=150, bbox_inches='tight')
+    
+    # Detailed printout
+    print("\nKey Transfer Scenarios:")
+    print("-" * 100)
+    print(f"{'Source':<15} | {'Target':<15} | {'Rank':<5} | {'Fidelity':<10} | Interpretation")
+    print("-" * 100)
+    
+    scenarios = [
+        ("Line-X", "Line-X", 1, "Identity transfer"),
+        ("Line-X", "Line-Y", 1, "Orthogonal lines (should fail)"),
+        ("Line-X", "Plane-XY", 1, "Line → Plane (partial)"),
+        ("Line-X", "Plane-XY", 2, "Line → Plane (expanded rank)"),
+        ("Plane-XY", "Helix", 2, "Flat plane → 3D curve"),
+        ("Plane-XY", "Helix", 3, "Full rank (loophole)"),
+        ("Circle-XY", "Helix", 2, "2D circle → 3D helix"),
+        ("Helix", "Sphere", 3, "Both use all 3 dims"),
+        ("Line-Diag", "Sphere", 1, "Diagonal line → Sphere"),
+    ]
+    
+    for src, tgt, rank, interp in scenarios:
+        fid, _ = calculate_fidelity(tasks[src], tasks[tgt], rank)
+        print(f"{src:<15} | {tgt:<15} | {rank:<5} | {fid:.4f}     | {interp}")
+    
+    return tasks
+
+def run_high_dim_experiment():
+    print("\n" + "=" * 80)
+    print("EXPERIMENT 2: High Dimensional Subspaces (ℝ¹⁰)")
+    print("=" * 80)
+    
+    ambient_dim = 10
+    
+    # Create tasks with different intrinsic dimensions
+    tasks = {}
+    
+    # Fixed subspaces
+    torch.manual_seed(42)  # Reproducibility
+    tasks["Plane-2D"], _ = make_random_subspace(ambient_dim, 2, 1000)
+    tasks["Subspace-3D"], _ = make_random_subspace(ambient_dim, 3, 1000)
+    tasks["Subspace-5D"], _ = make_random_subspace(ambient_dim, 5, 1000)
+    tasks["Subspace-7D"], _ = make_random_subspace(ambient_dim, 7, 1000)
+    tasks["Hypersphere"] = make_hypersphere(ambient_dim, 1000)
+    
+    # Overlapping subspaces (controlled overlap)
+    basis_a = torch.randn(ambient_dim, 3)
+    basis_a, _ = torch.linalg.qr(basis_a)
+    
+    # B shares 2 dims with A, has 1 new dim
+    basis_b = torch.cat([basis_a[:, :2], torch.randn(ambient_dim, 1)], dim=1)
+    basis_b, _ = torch.linalg.qr(basis_b)
+    
+    coords_a = torch.randn(1000, 3)
+    coords_b = torch.randn(1000, 3)
+    tasks["Space-A"] = (coords_a @ basis_a.T).unsqueeze(0)
+    tasks["Space-B"] = (coords_b @ basis_b.T).unsqueeze(0)
+    
+    # Print intrinsic dimensions
+    print("\nIntrinsic Dimensions:")
+    print("-" * 50)
+    for name, data in tasks.items():
+        dim, evals = get_intrinsic_dimension(data)
+        top_3 = evals[:3].numpy().round(4)
+        print(f"{name:<15} | Intrinsic Dim: {dim} | Top Evals: {top_3}")
+    
+    # Fidelity vs Rank curve
+    print("\n" + "-" * 80)
+    print("FIDELITY vs RANK (How much rank do you need?)")
+    print("-" * 80)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    axes = axes.flatten()
+    
+    test_pairs = [
+        ("Plane-2D", "Subspace-3D"),
+        ("Subspace-3D", "Subspace-5D"),
+        ("Subspace-5D", "Hypersphere"),
+        ("Space-A", "Space-B"),  # Overlapping!
+        ("Plane-2D", "Hypersphere"),
+        ("Subspace-3D", "Subspace-3D"),  # Identity
+    ]
+    
+    ranks = list(range(1, ambient_dim + 1))
+    
+    for ax, (src, tgt) in zip(axes, test_pairs):
+        fidelities = []
+        for r in ranks:
+            fid, _ = calculate_fidelity(tasks[src], tasks[tgt], r)
+            fidelities.append(fid)
+        
+        ax.plot(ranks, fidelities, 'o-', linewidth=2, markersize=6)
+        ax.axhline(y=0.95, color='g', linestyle='--', alpha=0.5, label='95% threshold')
+        ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.5, label='50% threshold')
+        ax.set_xlabel('Rank')
+        ax.set_ylabel('Fidelity')
+        ax.set_title(f'{src} → {tgt}')
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xticks(ranks)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    
+    plt.suptitle('Fidelity vs Rank in ℝ¹⁰', fontsize=14)
+    plt.tight_layout()
+    plt.savefig("fidelity_vs_rank_10d.png", dpi=150, bbox_inches='tight')
+    
+    # The key insight: overlapping subspaces
+    print("\nOVERLAPPING SUBSPACE ANALYSIS (Space-A ↔ Space-B):")
+    print("-" * 60)
+    print("Space-A and Space-B share 2 dimensions, each has 1 unique dim")
+    print()
+    for r in [1, 2, 3, 4, 5]:
+        fid_ab, _ = calculate_fidelity(tasks["Space-A"], tasks["Space-B"], r)
+        fid_ba, _ = calculate_fidelity(tasks["Space-B"], tasks["Space-A"], r)
+        print(f"Rank {r}: A→B = {fid_ab:.4f}, B→A = {fid_ba:.4f}")
+    
+    return tasks
+
+def run_practical_implications():
+    print("\n" + "=" * 80)
+    print("EXPERIMENT 3: Practical Implications for Transfer Learning")
+    print("=" * 80)
+    
+    ambient_dim = 50  # More realistic
+    
+    print("\nScenario: Pre-trained model on Task A, fine-tune on Task B")
+    print("Question: How much of A's subspace is useful for B?")
+    print("-" * 70)
+    
+    torch.manual_seed(123)
+    
+    # Simulating different transfer scenarios
+    scenarios = [
+        ("Same Domain", 10, 10, 0.9),      # High overlap
+        ("Related Domain", 10, 10, 0.5),    # Medium overlap  
+        ("Distant Domain", 10, 10, 0.1),    # Low overlap
+        ("Narrow → Wide", 5, 15, 0.8),      # Source is subset
+        ("Wide → Narrow", 15, 5, 0.8),      # Target is subset
+    ]
+    
+    results = []
+    
+    for name, src_dim, tgt_dim, overlap in scenarios:
+        # Create source subspace
+        basis_src = torch.randn(ambient_dim, src_dim)
+        basis_src, _ = torch.linalg.qr(basis_src)
+        
+        # Create target with controlled overlap
+        n_shared = int(min(src_dim, tgt_dim) * overlap)
+        n_new = tgt_dim - n_shared
+        
+        if n_shared > 0:
+            shared_basis = basis_src[:, :n_shared]
+        else:
+            shared_basis = torch.empty(ambient_dim, 0)
+        
+        if n_new > 0:
+            # Generate orthogonal new dimensions
+            new_basis = torch.randn(ambient_dim, n_new)
+            # Orthogonalize against existing
+            for i in range(n_new):
+                v = new_basis[:, i]
+                if n_shared > 0:
+                    v = v - shared_basis @ (shared_basis.T @ v)
+                v = v / v.norm()
+                new_basis[:, i] = v
+            basis_tgt = torch.cat([shared_basis, new_basis], dim=1)
+        else:
+            basis_tgt = shared_basis
+        
+        basis_tgt, _ = torch.linalg.qr(basis_tgt)
+        
+        # Generate data
+        src_data = (torch.randn(1000, src_dim) @ basis_src.T).unsqueeze(0)
+        tgt_data = (torch.randn(1000, tgt_dim) @ basis_tgt.T).unsqueeze(0)
+        
+        # Measure fidelity at different ranks
+        fids = []
+        for r in [1, 3, 5, 10, 15, 20]:
+            if r <= src_dim:
+                fid, _ = calculate_fidelity(src_data, tgt_data, r)
+                fids.append((r, fid))
+        
+        results.append((name, src_dim, tgt_dim, n_shared, fids))
+        
+        print(f"\n{name}:")
+        print(f"  Source dim: {src_dim}, Target dim: {tgt_dim}, Shared: {n_shared}")
+        print(f"  Fidelity by rank: ", end="")
+        for r, f in fids:
+            print(f"r{r}={f:.2f}  ", end="")
+        print()
+    
+    # Visualization
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    for name, src_dim, tgt_dim, n_shared, fids in results:
+        ranks = [f[0] for f in fids]
+        fidelities = [f[1] for f in fids]
+        ax.plot(ranks, fidelities, 'o-', label=f'{name} (shared={n_shared})', linewidth=2)
+    
+    ax.set_xlabel('Source Rank (# dimensions used)', fontsize=12)
+    ax.set_ylabel('Transfer Fidelity', fontsize=12)
+    ax.set_title('Transfer Learning: Fidelity vs Model Capacity\n(Ambient Dim = 50)', fontsize=14)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1.05)
+    
+    plt.tight_layout()
+    plt.savefig("transfer_scenarios.png", dpi=150, bbox_inches='tight')
+    
+    # Key takeaways
+    print("\n" + "=" * 70)
+    print("KEY TAKEAWAYS:")
+    print("=" * 70)
+    print("""
+1. RANK THRESHOLD: There's often a 'knee' in the fidelity curve.
+   - Below the knee: Underfitting, missing critical directions
+   - Above the knee: Diminishing returns (or overfitting risk)
+
+2. OVERLAP MATTERS: Shared subspace dimensions drive transfer.
+   - High overlap → Good transfer even at low rank
+   - Low overlap → Need higher rank, but may hit loophole
+
+3. THE LOOPHOLE: rank ≥ min(src_dim, ambient_dim) → Fidelity → 1
+   - This is why overparameterized models 'transfer' everywhere
+   - But they may not be learning useful structure!
+
+4. ASYMMETRY: A→B fidelity ≠ B→A fidelity
+   - Narrow → Wide: Source captures subset, fidelity < 1
+   - Wide → Narrow: Source spans target, fidelity = 1 (if rank sufficient)
+""")
+
+if __name__ == "__main__":
+    print("SPECTRAL PROJECTION MEMORY: EXTENDED ANALYSIS")
+    print("Exploring Transfer Fidelity in Higher Dimensions\n")
+    
+    run_3d_experiment()
+    run_high_dim_experiment()
+    run_practical_implications()
+    
+    print("\n✓ Done! Figures saved to current directory.")
+    plt.show()
