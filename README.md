@@ -222,8 +222,6 @@ The behavior of  as a function of rank  reveals the intrinsic compatibility of t
 * **Below **: The projector captures core shared features (e.g., edges, textures).
 * **Above **: The projector relies on overparameterized capacity to brute-force coverage.
 
-Our experiments (Section 4) demonstrate that calculating  provides a robust pre-training diagnostic. A low  predicts that fine-tuning will require destroying the source structure to accommodate the target, leading to catastrophic forgetting or poor convergence.
-
 
 
 
