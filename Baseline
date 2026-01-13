@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Spectral Fidelity (ResNet-18 features) on CIFAR-10 —  MINIMAL 
+================================================================================
+
+- Extracts 512-d ResNet-18 features (ImageNet pretrained)
+- Defines two domains: Vehicles vs Animals (CIFAR-10 classes)
+- Computes directional Spectral Fidelity:
+    F_k = Tr(Pi_source(k) * rho_target) / Tr(rho_target)
+- Computes noise-corrected overlap:
+    ΔF_k = F_k - k/D
+- Finds a "knee" k* on transfer curve (Veh->Ani and Ani->Veh)
+- Prints a non-trivial conclusion (never decides at k=D)
+- Saves plots to ./outputs (no plt.show)
+
+Android/Pydroid fixes:
+- matplotlib backend forced to "Agg" (file-only plotting)
+- DataLoader num_workers=0, pin_memory=False (avoids shm_open failure)
+"""
+
+import os
+import numpy as np
+import torch
+
+# Force headless plotting backend BEFORE importing pyplot
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    PLOTTING = True
+except Exception as e:
+    PLOTTING = False
+    plt = None
+    print("[WARN] Matplotlib plotting disabled:", repr(e))
+
+import torchvision.models as models
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader, Subset
+
+
+# -------------------------
+# Feature extractor
+# -------------------------
+def make_resnet18_feature_extractor(device: torch.device) -> torch.nn.Module:
+    weights = models.ResNet18_Weights.DEFAULT
+    model = models.resnet18(weights=weights)
+    model.fc = torch.nn.Identity()  # output: [B, 512]
+    model.to(device).eval()
+    return model
+
+
+@torch.no_grad()
+def get_features(model: torch.nn.Module, loader: DataLoader, device: torch.device, limit: int) -> torch.Tensor:
+    feats = []
+    count = 0
+    for x, _y in loader:
+        x = x.to(device)
+        f = model(x)  # [B, 512]
+        feats.append(f.cpu())
+        count += f.size(0)
+        if count >= limit:
+            break
+    return torch.cat(feats, dim=0)[:limit]
+
+
+# -------------------------
+# Spectral fidelity
+# -------------------------
+def covariance(X: torch.Tensor) -> torch.Tensor:
+    X = X.to(torch.float64)
+    X = X - X.mean(dim=0, keepdim=True)
+    N = X.shape[0]
+    return (X.T @ X) / max(N, 1)
+
+
+def spectral_fidelity_curve(source_feats: torch.Tensor, target_feats: torch.Tensor, ranks, D: int):
+    """
+    F_k = Tr(Pi_s(k) rho_t) / Tr(rho_t), where Pi_s(k) is projector onto
+    top-k eigenvectors of rho_s.
+    Computes all ranks efficiently (single eigendecomp).
+    """
+    rho_s = covariance(source_feats)
+    rho_t = covariance(target_feats)
+
+    evals, evecs = torch.linalg.eigh(rho_s)   # ascending
+    idx = torch.argsort(evals, descending=True)
+    U = evecs[:, idx]                         # [D, D]
+
+    Ut_rhot_U = U.T @ rho_t @ U
+    diag = torch.diag(Ut_rhot_U).clamp(min=0)
+    denom = torch.trace(rho_t).clamp(min=1e-12)
+
+    cumsum = torch.cumsum(diag, dim=0)
+
+    out = []
+    for k in ranks:
+        k = int(k)
+        if k <= 0:
+            out.append(0.0)
+        elif k >= D:
+            out.append((cumsum[D - 1] / denom).item())
+        else:
+            out.append((cumsum[k - 1] / denom).item())
+    return out
+
+
+# -------------------------
+# Knee + reporting
+# -------------------------
+def knee_index(xs, ys) -> int:
+    """
+    Knee = point with maximum distance to chord (endpoints), normalized.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+
+    xn = (xs - xs[0]) / (xs[-1] - xs[0] + 1e-12)
+    yn = (ys - ys[0]) / (ys[-1] - ys[0] + 1e-12)
+
+    dist = np.abs(yn - xn) / np.sqrt(2.0)
+    return int(np.argmax(dist))
+
+
+def verdict(ranks, F_self, F_cross, D, name_self, name_cross):
+    ranks = np.asarray(ranks, dtype=int)
+    F_self = np.asarray(F_self, dtype=float)
+    F_cross = np.asarray(F_cross, dtype=float)
+
+    baseline = ranks / float(D)
+    dF_self = F_self - baseline
+    dF_cross = F_cross - baseline
+
+    i = knee_index(ranks, F_cross)
+    k_star = int(ranks[i])
+
+    # never decide at full rank (trivial F=1)
+    if k_star >= D:
+        nontriv = np.where(ranks < D)[0]
+        i = int(nontriv[-1])
+        k_star = int(ranks[i])
+
+    gap = float(dF_self[i] - dF_cross[i])
+
+    print("\n" + "=" * 70)
+    print("NON-TRIVIAL VERDICT (knee-based, baseline-corrected)")
+    print(f"Chosen knee k* = {k_star} (out of D={D})")
+    print(f"Baseline at k*: {baseline[i]:.3f} = k*/D")
+    print(f"\nAt k*={k_star}:")
+    print(f"  {name_self}:  F={F_self[i]:.3f} | ΔF={dF_self[i]:.3f}")
+    print(f"  {name_cross}: F={F_cross[i]:.3f} | ΔF={dF_cross[i]:.3f}")
+    print(f"  ΔF_gap={gap:.3f}")
+
+    if dF_cross[i] <= 0.02:
+        msg = "Transfer near isotropic baseline → little shared structure."
+    elif gap >= 0.10:
+        msg = "Strong low-rank structure mismatch."
+    elif gap >= 0.05:
+        msg = "Moderate mismatch."
+    else:
+        msg = "High overlap at the knee."
+
+    print("\nConclusion:", msg)
+    print("Note: k=D always yields F=1.0; we never use it for the decision.")
+    print("=" * 70)
+
+    return baseline, dF_self, dF_cross, k_star
+
+
+def save_plot(fig, path):
+    try:
+        fig.savefig(path, dpi=160, bbox_inches="tight")
+        print("Plot saved:", os.path.abspath(path))
+    except Exception as e:
+        print("[WARN] Plot save failed:", os.path.abspath(path), repr(e))
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    print("Initializing experiment...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    out_dir = os.path.join(os.getcwd(), "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+
+    model = make_resnet18_feature_extractor(device)
+
+    transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    print("Downloading/Loading CIFAR10...")
+    cifar = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+    labels = cifar.targets  # fast access
+
+    veh_classes = {0, 1, 8, 9}
+    ani_classes = {2, 3, 4, 5, 6, 7}
+
+    limit = 1000
+    vehicle_idx = [i for i, y in enumerate(labels) if y in veh_classes][:limit]
+    animal_idx  = [i for i, y in enumerate(labels) if y in ani_classes][:limit]
+
+    loader_veh = DataLoader(Subset(cifar, vehicle_idx), batch_size=32,
+                            shuffle=False, num_workers=0, pin_memory=False)
+    loader_ani = DataLoader(Subset(cifar, animal_idx), batch_size=32,
+                            shuffle=False, num_workers=0, pin_memory=False)
+
+    print("Extracting features...")
+    feats_veh = get_features(model, loader_veh, device, limit)
+    feats_ani = get_features(model, loader_ani, device, limit)
+    feats_noise = torch.randn_like(feats_veh)
+
+    print(f"Feature shape: {feats_veh.shape}")
+    D = int(feats_veh.shape[1])
+
+    # Dense-ish ranks (still light enough for CPU phone)
+    ranks = sorted(set(list(range(1, 129, 8)) + list(range(128, 257, 16)) + [300, 350, 400, 450, D]))
+    if ranks[-1] != D:
+        ranks.append(D)
+
+    print("\nComputing Spectral Fidelity...")
+    F_vv = spectral_fidelity_curve(feats_veh, feats_veh, ranks, D)
+    F_va = spectral_fidelity_curve(feats_veh, feats_ani, ranks, D)
+    F_av = spectral_fidelity_curve(feats_ani, feats_veh, ranks, D)
+    F_nn = spectral_fidelity_curve(feats_veh, feats_noise, ranks, D)
+
+    # Print a small subset for readability (nearest ranks)
+    show_targets = [1, 10, 50, 100, 200, 300, D]
+    show = []
+    for r in show_targets:
+        show.append(min(ranks, key=lambda x: abs(x - r)))
+    show = sorted(set(show))
+    idx = {r: i for i, r in enumerate(ranks)}
+
+    for r in show:
+        i = idx[r]
+        print(f"Rank {r:<3}: Veh->Veh {F_vv[i]:.3f} | Veh->Ani {F_va[i]:.3f} | "
+              f"Ani->Veh {F_av[i]:.3f} | Veh->Noise {F_nn[i]:.3f}")
+
+    print("\nNoise sanity-check (expected ~k/D):")
+    for r in show:
+        print(f"  k={r:<3} expected≈{r/D:.3f}")
+
+    # Verdicts
+    baseline_va, dF_vv, dF_va, k_star_va = verdict(ranks, F_vv, F_va, D, "Veh->Veh", "Veh->Ani")
+
+    F_aa = spectral_fidelity_curve(feats_ani, feats_ani, ranks, D)
+    baseline_av, dF_aa, dF_av, k_star_av = verdict(ranks, F_aa, F_av, D, "Ani->Ani", "Ani->Veh")
+
+    # Plots (saved only)
+    if PLOTTING:
+        fig1 = plt.figure(figsize=(10, 6))
+        plt.plot(ranks, F_vv, marker="o", label="F: Veh->Veh")
+        plt.plot(ranks, F_va, marker="s", label="F: Veh->Ani")
+        plt.plot(ranks, F_av, marker="^", label="F: Ani->Veh")
+        plt.plot(ranks, F_nn, linestyle="--", marker="x", label="F: Veh->Noise")
+        plt.plot(ranks, baseline_va, linestyle="--", label="Baseline ~ k/D")
+        plt.axvline(x=k_star_va, linestyle=":", alpha=0.7, label=f"Knee (Veh->Ani) k*={k_star_va}")
+        plt.xlabel("Rank k")
+        plt.ylabel("Fidelity F")
+        plt.title("Spectral Fidelity (ResNet-18 features on CIFAR-10)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        save_plot(fig1, os.path.join(out_dir, "resnet_fidelity.png"))
+        plt.close(fig1)
+
+        fig2 = plt.figure(figsize=(10, 6))
+        plt.plot(ranks, dF_vv, marker="o", label="ΔF: Veh->Veh")
+        plt.plot(ranks, dF_va, marker="s", label="ΔF: Veh->Ani")
+        plt.axhline(y=0.0, linestyle="--", alpha=0.6)
+        plt.axvline(x=k_star_va, linestyle=":", alpha=0.7, label=f"Knee k*={k_star_va}")
+        plt.xlabel("Rank k")
+        plt.ylabel("ΔF = F - k/D")
+        plt.title("Noise-corrected Overlap (ΔF)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        save_plot(fig2, os.path.join(out_dir, "resnet_delta_fidelity.png"))
+        plt.close(fig2)
+
+        print("\nPlots directory:", os.path.abspath(out_dir))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
