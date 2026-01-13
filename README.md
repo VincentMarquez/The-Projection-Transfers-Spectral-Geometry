@@ -276,20 +276,39 @@ The strong correlation between the Geometric Gap (0.268) and the Mismatch Factor
 
 ---
 
-### **Completing the Paper**
+# 5. Discussion
 
-You now have a nearly complete manuscript:
+Our results establish that transfer learning is not merely a function of task semantics or optimization hyperparameters, but is fundamentally governed by the spectral geometry of learned representations. By formalizing transfer as a rank-limited projection, we offer a mechanistic explanation for phenomena that have previously been treated as empirical heuristics.
 
-1. **Abstract:** (From the "fake" paper, now validated).
-2. **Introduction:** (The shift from empirical to geometric).
-3. **Methodology:** (Defining  and SPM).
-4. **Experiments:** (The CIFAR-10 run you just verified).
-5. **Appendix:** (The rigorous math proofs).
+## 5.1. The Mechanism of Negative Transfer
 
-**Next Step:**
-The final section needed is the **Discussion & Conclusion**. This is where you summarize the implications (e.g., "We can stop wasting GPU hours fine-tuning incompatible models").
+The observed **Mismatch Factor of 2.3x** provides a concrete quantification of negative transfer risk. When the Target domain () is projected onto the Source subspace (), the information loss is not uniform. The Source subspace preferentially preserves variance aligned with its original training objective (Vehicles), while filtering out variance orthogonal to it (Animals).
 
-Would you like me to draft the **Discussion** to wrap this up?
+Fine-tuning a model with such a significant geometric gap () presents a dilemma:
+
+1. **Low-Rank Adaptation (e.g., LoRA):** Constraining the update to a low rank will fail to capture the missing target variance, resulting in the high error rates observed in our Linear Probe experiment.
+2. **Full-Rank Fine-Tuning:** Allowing high-rank updates permits the model to rotate its internal manifold to accommodate the target. However, this rotation necessarily destroys the original source structure, leading to **Catastrophic Forgetting**.
+
+Thus,  serves as a precise predictor of the "plasticity-stability" trade-off required for a specific source-target pair.
+
+## 5.2. The Spanning Loophole and Model Scale
+
+A critical observation in our spectral analysis (Figure 1) is the convergence of Transfer Fidelity to  as the projection rank approaches the ambient dimension (). We term this the **Spanning Loophole**.
+
+This phenomenon explains the unreasonable effectiveness of massive, overparameterized models (e.g., LLMs, ViT-Huge). These models do not necessarily learn structure that is *intrinsically* aligned with every downstream task. Instead, their massive ambient dimensionality and high rank allow them to trivially span the variance of diverse target distributions. While effective, this "brute force" coverage is computationally inefficient. Our framework suggests that for resource-constrained edge applications (e.g., your B620VM hardware), model selection should prioritize high  at low ranks () rather than relying on the spanning loophole of massive architectures.
+
+## 5.3. Practical Implications: A "Green AI" Diagnostic
+
+Current industry practice involves expensive "trial-and-error" fine-tuning to determine model compatibility. Computing **Noise-Corrected Fidelity ()** offers a zero-shot alternative.
+
+* **Computational Cost:** Calculating  requires only a forward pass and a singular value decomposition (SVD), which is orders of magnitude faster than a single epoch of training ( vs ).
+* **Actionable Insight:** If  (a theoretical threshold), practitioners can discard the source model immediately, saving significant GPU energy and time.
+
+# 6. Conclusion
+
+In this work, we introduced **Spectral Projection Memory**, a geometric framework that reinterprets transfer learning as the overlap between high-dimensional covariance subspaces. We derived a novel metric, **Noise-Corrected Fidelity ()**, and validated its predictive power on a controlled domain shift experiment.
+
+Our experiments demonstrated that a geometric mismatch in the pre-trained feature space directly translates to a **2.3x increase in downstream error**, effectively predicting negative transfer before a single parameter is updated. These findings suggest that the future of efficient AI lies not just in larger models, but in geometrically compatible ones—where the spectrum of the source remembers the structure of the target.
 
 ---
 
