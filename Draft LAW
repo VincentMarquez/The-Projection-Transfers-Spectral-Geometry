@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Rank–Fidelity Scaling Law Testbed
+===========================================================
+
+
+- fit_loglog_knee now uses k_star_srcBasis
+"""
+
+import os
+import csv
+import numpy as np
+import torch
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    PLOTTING = True
+except Exception as e:
+    PLOTTING = False
+    plt = None
+    print("[WARN] Plotting disabled:", repr(e))
+
+import torchvision.models as models
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader, Subset
+
+
+OUT_DIR = os.path.join(os.getcwd(), "outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+BACKBONES = ["resnet18"]
+SAMPLES_PER_DOMAIN = 1000
+BATCH_SIZE = 32
+NUM_WORKERS = 0
+PIN_MEMORY = False
+RANKS_SCHEDULE = None
+COV_EPS = 0.0
+
+DOMAINS = {
+    "vehicles_all": [0, 1, 8, 9],
+    "animals_all":  [2, 3, 4, 5, 6, 7],
+
+    "auto":  [1],
+    "truck": [9],
+    "ship":  [8],
+    "plane": [0],
+
+    "cat":   [3],
+    "dog":   [5],
+    "deer":  [4],
+    "horse": [7],
+    "frog":  [6],
+}
+
+PAIRS = [
+    ("vehicles_all", "animals_all"),
+    ("auto", "truck"),
+    ("cat", "dog"),
+    ("animals_all", "ship"),
+    ("plane", "frog"),
+]
+
+
+def build_backbone(name: str, device: torch.device):
+    name = name.lower().strip()
+    if name == "resnet18":
+        weights = models.ResNet18_Weights.DEFAULT
+        m = models.resnet18(weights=weights)
+        m.fc = torch.nn.Identity()
+        D = 512
+        return m.to(device).eval(), D, "resnet18"
+    raise ValueError(f"Unknown backbone: {name}")
+
+
+@torch.no_grad()
+def get_features(model, loader, device, limit: int):
+    feats = []
+    n = 0
+    for x, _y in loader:
+        x = x.to(device)
+        f = model(x)
+        feats.append(f.cpu())
+        n += f.size(0)
+        if n >= limit:
+            break
+    return torch.cat(feats, dim=0)[:limit]
+
+
+def make_cifar10(transform):
+    return datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+
+
+def indices_for_classes(labels, class_list, limit):
+    idx = [i for i, y in enumerate(labels) if y in set(class_list)]
+    return idx[:limit]
+
+
+def covariance(X: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+    X = X.to(torch.float64)
+    X = X - X.mean(dim=0, keepdim=True)
+    N = X.shape[0]
+    rho = (X.T @ X) / max(N, 1)
+    if eps > 0:
+        rho = rho + eps * torch.eye(rho.shape[0], dtype=rho.dtype, device=rho.device)
+    return rho
+
+
+def spectral_fidelity_curve(source_feats: torch.Tensor, target_feats: torch.Tensor, ranks, D: int, eps: float = 0.0):
+    rho_s = covariance(source_feats, eps=eps)
+    rho_t = covariance(target_feats, eps=eps)
+
+    evals, evecs = torch.linalg.eigh(rho_s)
+    idx = torch.argsort(evals, descending=True)
+    U = evecs[:, idx]
+
+    Ut_rhot_U = U.T @ rho_t @ U
+    diag = torch.diag(Ut_rhot_U).clamp(min=0)
+    denom = torch.trace(rho_t).clamp(min=1e-12)
+
+    cumsum = torch.cumsum(diag, dim=0)
+
+    out = []
+    for k in ranks:
+        k = int(k)
+        if k <= 0:
+            out.append(0.0)
+        elif k >= D:
+            out.append((cumsum[D - 1] / denom).item())
+        else:
+            out.append((cumsum[k - 1] / denom).item())
+    return np.array(out, dtype=float)
+
+
+def knee_index(xs, ys) -> int:
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    xn = (xs - xs[0]) / (xs[-1] - xs[0] + 1e-12)
+    yn = (ys - ys[0]) / (ys[-1] - ys[0] + 1e-12)
+    dist = np.abs(yn - xn) / np.sqrt(2.0)
+    return int(np.argmax(dist))
+
+
+def compute_knee_metrics(ranks, F_self, F_cross, D):
+    ranks = np.asarray(ranks, dtype=int)
+    F_self = np.asarray(F_self, dtype=float)
+    F_cross = np.asarray(F_cross, dtype=float)
+
+    baseline = ranks / float(D)
+    dF_self = F_self - baseline
+    dF_cross = F_cross - baseline
+
+    i = knee_index(ranks, F_cross)
+    k_star = int(ranks[i])
+    if k_star >= D:
+        nontriv = np.where(ranks < D)[0]
+        i = int(nontriv[-1])
+        k_star = int(ranks[i])
+
+    return {
+        "k_star": k_star,
+        "k_star_over_D": k_star / float(D),
+        "DeltaF_self": float(dF_self[i]),
+        "DeltaF_cross": float(dF_cross[i]),
+        "Gap": float(dF_self[i] - dF_cross[i]),
+    }
+
+
+def fit_loglog_knee(records, k_key="k_star_srcBasis", theta_key="Theta_hat"):
+    """
+    Fits: log(k*) = c + m*log(1/Theta_hat)
+    Uses k_key present in records (default: k_star_srcBasis).
+    """
+    try:
+        kstar = np.array([r[k_key] for r in records], dtype=float)
+        theta = np.array([r[theta_key] for r in records], dtype=float)
+    except KeyError as e:
+        print("[WARN] Missing key in records for fit:", e)
+        return None
+
+    mask = theta > 1e-6
+    if mask.sum() < 3:
+        return None
+
+    x = np.log(1.0 / theta[mask])
+    y = np.log(kstar[mask])
+
+    m, c = np.polyfit(x, y, 1)
+    gamma_est = 1.0 / m if abs(m) > 1e-12 else float("inf")
+    return {"slope_m": float(m), "intercept_c": float(c), "gamma_est": float(gamma_est)}
+
+
+def save_csv(path, rows, fieldnames):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print("CSV saved:", os.path.abspath(path))
+
+
+def main():
+    print("Initializing scaling-law testbed...")
+    print("Device:", DEVICE)
+
+    transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+    cifar = make_cifar10(transform)
+    labels = cifar.targets
+
+    all_results = []
+
+    for backbone_name in BACKBONES:
+        model, D, model_name = build_backbone(backbone_name, DEVICE)
+
+        print("\n" + "=" * 72)
+        print(f"Backbone: {model_name} (D={D})")
+        print("=" * 72)
+
+        ranks = sorted(set(
+            list(range(1, min(129, D), 8)) +
+            list(range(128, min(257, D), 16)) +
+            [300, 350, 400, 450, D]
+        ))
+        ranks = [r for r in ranks if r <= D]
+        if ranks[-1] != D:
+            ranks.append(D)
+
+        domain_feats = {}
+
+        print("Extracting features for domains...")
+        for domain_name, class_list in DOMAINS.items():
+            idx = indices_for_classes(labels, class_list, SAMPLES_PER_DOMAIN)
+            loader = DataLoader(
+                Subset(cifar, idx),
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                num_workers=NUM_WORKERS,
+                pin_memory=PIN_MEMORY
+            )
+            feats = get_features(model, loader, DEVICE, limit=len(idx))
+            domain_feats[domain_name] = feats
+            print(f"  {domain_name:<12} -> feats {tuple(feats.shape)}  (classes={class_list})")
+
+        any_feats = next(iter(domain_feats.values()))
+        feats_noise = torch.randn_like(any_feats)
+
+        print("\nRunning pair sweep...")
+        for (src, tgt) in PAIRS:
+            Xs = domain_feats[src]
+            Xt = domain_feats[tgt]
+
+            F_ss = spectral_fidelity_curve(Xs, Xs, ranks, D, eps=COV_EPS)
+            F_st = spectral_fidelity_curve(Xs, Xt, ranks, D, eps=COV_EPS)
+
+            F_tt = spectral_fidelity_curve(Xt, Xt, ranks, D, eps=COV_EPS)
+            F_ts = spectral_fidelity_curve(Xt, Xs, ranks, D, eps=COV_EPS)
+
+            F_sn = spectral_fidelity_curve(Xs, feats_noise, ranks, D, eps=COV_EPS)
+
+            m_st = compute_knee_metrics(ranks, F_ss, F_st, D)
+            m_ts = compute_knee_metrics(ranks, F_tt, F_ts, D)
+
+            rec = {
+                "model": model_name,
+                "D": D,
+                "source": src,
+                "target": tgt,
+
+                "k_star_srcBasis": m_st["k_star"],
+                "k_star_over_D_srcBasis": m_st["k_star_over_D"],
+                "DeltaF_self_srcBasis": m_st["DeltaF_self"],
+                "DeltaF_cross_srcBasis": m_st["DeltaF_cross"],
+                "Gap_srcBasis": m_st["Gap"],
+
+                "k_star_tgtBasis": m_ts["k_star"],
+                "k_star_over_D_tgtBasis": m_ts["k_star_over_D"],
+                "DeltaF_self_tgtBasis": m_ts["DeltaF_self"],
+                "DeltaF_cross_tgtBasis": m_ts["DeltaF_cross"],
+                "Gap_tgtBasis": m_ts["Gap"],
+
+                "Theta_hat": m_st["DeltaF_cross"],
+                "Noise_check_maxAbsErr": float(np.max(np.abs(F_sn - (np.array(ranks)/float(D))))),
+            }
+
+            all_results.append(rec)
+
+            print(f"- {src} -> {tgt}")
+            print(f"    srcBasis: k*={rec['k_star_srcBasis']}, ΔF_cross={rec['DeltaF_cross_srcBasis']:.3f}, Gap={rec['Gap_srcBasis']:.3f}")
+            print(f"    tgtBasis: k*={rec['k_star_tgtBasis']}, ΔF_cross={rec['DeltaF_cross_tgtBasis']:.3f}, Gap={rec['Gap_tgtBasis']:.3f}")
+            print(f"    noise max|err| vs k/D: {rec['Noise_check_maxAbsErr']:.4f}")
+
+        model_records = [r for r in all_results if r["model"] == model_name]
+        fit = fit_loglog_knee(model_records)
+
+        print("\nScaling fit (within backbone): log(k*) ~ c + m*log(1/Theta_hat)")
+        if fit is None:
+            print("  Not enough valid points (need >=3 with Theta_hat>0).")
+        else:
+            print(f"  slope m = {fit['slope_m']:.3f}")
+            print(f"  implied gamma ≈ 1/m = {fit['gamma_est']:.3f}   (heuristic)")
+
+    fieldnames = [
+        "model", "D", "source", "target",
+        "k_star_srcBasis", "k_star_over_D_srcBasis",
+        "DeltaF_self_srcBasis", "DeltaF_cross_srcBasis", "Gap_srcBasis",
+        "k_star_tgtBasis", "k_star_over_D_tgtBasis",
+        "DeltaF_self_tgtBasis", "DeltaF_cross_tgtBasis", "Gap_tgtBasis",
+        "Theta_hat", "Noise_check_maxAbsErr",
+    ]
+    csv_path = os.path.join(OUT_DIR, "scaling_rank_fidelity_results.csv")
+    save_csv(csv_path, all_results, fieldnames)
+
+    print("\nDone.")
+    print("Outputs directory:", os.path.abspath(OUT_DIR))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
