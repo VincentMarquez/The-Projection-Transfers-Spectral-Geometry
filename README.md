@@ -184,6 +184,45 @@ Based on your code results (`6148.jpg`), we can now formulate the "Laws" mathema
 * **Result:** As , .
 * **Implication:** High fidelity in Large Language Models is often due to **ambient spanning** (brute force coverage), not structural alignment.
 
+# 3. Methodology: Spectral Projection Memory
+
+Current transfer learning approaches implicitly assume that optimization on a source task induces a representation compatible with the target. We challenge this assumption by introducing **Spectral Projection Memory (SPM)**, a framework that models transfer as a rank-limited geometric projection. We further derive **Noise-Corrected Fidelity ()** as a quantifiable metric for structural compatibility.
+
+## 3.1. The Spectral Projection Operator
+
+We define the learned representation of a source task  as a high-dimensional manifold embedded in activation space . To isolate the structural "memory" of this task, we construct a subspace projector from the covariance spectrum of the source activations.
+
+Let  be the centered feature matrix of the source domain. The empirical covariance matrix is given by . By the Spectral Theorem, we decompose  into its eigenbasis:
+
+where  are the eigenvalues representing the variance captured along each principal direction .
+
+We define the **Rank- Source Projector**  as the orthogonal projection onto the subspace spanned by the top- eigenvectors (the "memory bandwidth"):
+
+This operator acts as a "spectral filter," permitting only the variance aligned with the source task's geometry to pass, while nullifying orthogonal components.
+
+## 3.2. Quantifying Compatibility: Transfer Fidelity
+
+To predict transfer success without training, we measure how much of the target task's structure is preserved by the source projector. Let  be the covariance of the target representation. We define **Transfer Fidelity ()** as the fraction of target energy captured by the source subspace:
+
+While  measures total overlap, it can be inflated by chance alignment in high-dimensional spaces. As , the projector approaches the identity matrix (), trivially yielding  regardless of task relatedness (the "Spanning Loophole").
+
+### 3.2.1. Noise-Corrected Fidelity ()
+
+To isolate genuine structural alignment from isotropic background noise, we introduce **Noise-Corrected Fidelity ()**:
+
+where  represents the expected fidelity of a random subspace under an isotropic assumption.
+
+* ****: Indicates statistically significant shared geometry (Positive Transfer potential).
+* ****: Indicates the source and target are geometrically orthogonal (Negative Transfer risk).
+
+## 3.3. The Rank-Fidelity Diagnostic
+
+The behavior of  as a function of rank  reveals the intrinsic compatibility of the tasks. We identify a critical "knee" rank  where the marginal gain in  diminishes.
+
+* **Below **: The projector captures core shared features (e.g., edges, textures).
+* **Above **: The projector relies on overparameterized capacity to brute-force coverage.
+
+Our experiments (Section 4) demonstrate that calculating  provides a robust pre-training diagnostic. A low  predicts that fine-tuning will require destroying the source structure to accommodate the target, leading to catastrophic forgetting or poor convergence.
 
 
 
