@@ -162,27 +162,64 @@ This proves that  is bounded  and rigorously measures geometric alignment.
 
 ---
 
-### 3. Formalizing the "Three Laws" (For your Abstract)
+## 3. Transfer Regimes and Structural Properties
 
-Based on your code results (`6148.jpg`), we can now formulate the "Laws" mathematically for the paper.
+The rank–fidelity curve (F^{(k)}(s!\to!t)) exhibits three recurring behaviors that are useful for interpretation. Two are structural consequences of subspace geometry; the third is an empirical regime transition that appears consistently in our controlled experiments.
 
-#### **Lemma 1: The Rank-Fidelity Knee (The "Knee Law")**
+### Proposition 1 (Knee / Effective Shared Rank; empirical)
 
-* **Observation:** The fidelity curve  is concave and exhibits a "knee" at , where  is the intrinsic dimensionality of the shared structure.
-* **Formal Statement:** For , . For , $ \frac{\partial F}{\partial k} \to 0$.
+**Observation.** As (k) increases, (F^{(k)}(s!\to!t)) rises rapidly over a small range of ranks and then exhibits diminishing returns, forming a “knee.”
 
-#### **Lemma 2: The Asymmetry of Inclusion (The "Red Line" Law)**
+**Operational definition.** We define the **effective shared rank** (k^\star(s!\to!t)) as the smallest rank where marginal gains fall below a fixed threshold:
+[
+k^\star ;=; \min\left{k:; F^{(k+1)}-F^{(k)} \le \varepsilon \right},
+]
+(or equivalently via standard knee detection on the discrete curve (F^{(k)})). In our experiments, (k^\star) correlates with the number of shared spectral directions between source and target (i.e., the effective dimensionality of the shared structure).
 
-* **Observation:** Narrow sources cannot transfer to wide targets.
-* **Formal Statement:** If , then .
-* **Proof:** The source subspace  has dimension . If target  has dimension , there exists at least one direction in  orthogonal to . The projection of variance along this direction is 0, thus  can never reach 1.
+**Remark.** Concavity is not required as an assumption; (F^{(k)}) is monotone non-decreasing by construction (see Proposition 2), and the knee reflects concentration of target energy into a small number of aligned directions.
 
-#### **Lemma 3: The Spanning Loophole (The "LLM" Law)**
+---
 
-* **Observation:** Overparameterized sources transfer to everything.
-* **Formal Statement:** If  is fixed and  (source spans the whole space), then  (Identity matrix).
-* **Result:** As , .
-* **Implication:** High fidelity in Large Language Models is often due to **ambient spanning** (brute force coverage), not structural alignment.
+### Proposition 2 (Monotonicity and Transfer Asymmetry; structural)
+
+Let (\Pi_s^{(k)}) denote the rank-(k) projector built from the source covariance eigenbasis, and let
+[
+F^{(k)}(s!\to!t) ;=; \frac{\mathrm{Tr}(\Pi_s^{(k)},\rho_t)}{\mathrm{Tr}(\rho_t)}.
+]
+
+**(a) Monotonicity.** For (k_1 \le k_2),
+[
+F^{(k_1)}(s!\to!t) \le F^{(k_2)}(s!\to!t),
+]
+since (\Pi_s^{(k_2)} = \Pi_s^{(k_1)} + \sum_{i=k_1+1}^{k_2} u_i u_i^\top) and each added term contributes nonnegative captured variance.
+
+**(b) Asymmetry.** In general,
+[
+F^{(k)}(s!\to!t) \neq F^{(k)}(t!\to!s),
+]
+because the projector is constructed from the source eigenspace only. In particular, if the target has nontrivial variance in directions orthogonal to (\mathrm{Range}(\Pi_s^{(k)})), then (F^{(k)}(s!\to!t) < 1) regardless of optimization or parameter count.
+
+**Interpretation.** This yields a geometric asymmetry: **narrow-to-wide** transfer is structurally limited at fixed (k), while **wide-to-narrow** transfer can achieve high fidelity once (k) is sufficient to span the target support.
+
+---
+
+### Proposition 3 (Spanning Regime / “Loophole”; structural)
+
+Let (\mathrm{rank}(\rho_t)=r_t) be the rank of the target covariance (equivalently the dimension of its support).
+
+**Claim.** If the source projector spans the target support, i.e.
+[
+\mathrm{Range}(\rho_t) \subseteq \mathrm{Range}(\Pi_s^{(k)}),
+]
+then
+[
+F^{(k)}(s!\to!t)=1.
+]
+
+**Sufficient condition.** A sufficient (not necessary) condition is (k \ge r_t) together with alignment of (\mathrm{Range}(\Pi_s^{(k)})) to include the support of (\rho_t). In the extreme case (k=D) (ambient dimension), (\Pi_s^{(D)} = I) and therefore (F^{(D)}(s!\to!t)=1) for any target.
+
+**Interpretation.** High fidelity at large (k) can therefore be **degenerate**, reflecting ambient spanning rather than shared structure. This motivates evaluating transfer in the low-rank regime and (optionally) using a noise-corrected baseline such as (\Delta F^{(k)} = F^{(k)} - k/D).
+
 
 # 3. Methodology: Spectral Projection Memory
 
