@@ -332,7 +332,7 @@ Thus,  serves as a precise predictor of the "plasticity-stability" trade-off req
 
 A critical observation in our spectral analysis (Figure 1) is the convergence of Transfer Fidelity to  as the projection rank approaches the ambient dimension (). We term this the **Spanning Loophole**.
 
-This phenomenon explains the unreasonable effectiveness of massive, overparameterized models (e.g., LLMs, ViT-Huge). These models do not necessarily learn structure that is *intrinsically* aligned with every downstream task. Instead, their massive ambient dimensionality and high rank allow them to trivially span the variance of diverse target distributions. While effective, this "brute force" coverage is computationally inefficient. Our framework suggests that for resource-constrained edge applications (e.g., your B620VM hardware), model selection should prioritize high  at low ranks () rather than relying on the spanning loophole of massive architectures.
+This phenomenon explains the unreasonable effectiveness of massive, overparameterized models (e.g., LLMs, ViT-Huge). These models do not necessarily learn structure that is *intrinsically* aligned with every downstream task. Instead, their massive ambient dimensionality and high rank allow them to trivially span the variance of diverse target distributions. While effective, this "brute force" coverage is computationally inefficient. Our framework suggests that for resource-constrained edge applications , model selection should prioritize high  at low ranks () rather than relying on the spanning loophole of massive architectures.
 
 ## 5.3. Practical Implications: A "Green AI" Diagnostic
 
